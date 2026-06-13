@@ -16,7 +16,15 @@ class Lfm2VlMultiModalProjector(nn.Module):
         super().__init__()
         in_channels = config.vision_config.hidden_size * (config.downsample_factor**2)
         self.projector_use_layernorm = config.projector_use_layernorm
-        self.layer_norm = nn.LayerNorm(in_channels)
+        # Only allocate the layer norm when the checkpoint actually uses it.
+        # Allocating it unconditionally registers `layer_norm.{weight,bias}`
+        # parameters that checkpoints with `projector_use_layernorm=False` do
+        # not ship, so `load_weights(strict=True)` fails with "Missing 2
+        # parameters". This mirrors the reference HF implementation
+        # (`Lfm2VlMultiModalProjector` in transformers), which sets
+        # `layer_norm = LayerNorm(...) if projector_use_layernorm else None`.
+        if self.projector_use_layernorm:
+            self.layer_norm = nn.LayerNorm(in_channels)
         self.linear_1 = nn.Linear(
             in_channels,
             config.projector_hidden_size,
@@ -224,4 +232,21 @@ class Model(nn.Module):
 
             return key
 
-        return {transform_key(k): v for k, v in weights.items()}
+        weights = {transform_key(k): v for k, v in weights.items()}
+
+        # Some checkpoints (e.g. inconsistent community MLX exports) ship
+        # `multi_modal_projector.layer_norm.{weight,bias}` even though their
+        # config sets `projector_use_layernorm=False`. The projector neither
+        # allocates the module nor applies it in that case, so these weights
+        # are orphans that would trip `load_weights(strict=True)` with
+        # "Received N parameters not in model". Drop them; the forward pass is
+        # unchanged because the layer norm is never applied when the flag is
+        # off.
+        if not self.config.projector_use_layernorm:
+            weights = {
+                k: v
+                for k, v in weights.items()
+                if "multi_modal_projector.layer_norm" not in k
+            }
+
+        return weights
